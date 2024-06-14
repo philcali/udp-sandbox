@@ -1,8 +1,9 @@
 import asyncio
 import json
 import logging
+import zlib
 from Crypto.Cipher import AES
-from Crypto.Hash import SHA256
+from Crypto.Hash import SHA256, CMAC
 from base64 import b64decode, b64encode
 
 
@@ -17,12 +18,14 @@ class Channel:
             port,
             direction,
             key,
+            auth=False,
             send_port=None,
             send_addr=None) -> None:
         self.name = name
         self.addr = addr
         self.port = port
         self.key = key
+        self.auth = auth
         self.send_port = send_port
         self.send_addr = send_addr
         self.direction = direction
@@ -30,6 +33,20 @@ class Channel:
     def set_connection_future(self, on_con_lost):
         self.on_con_lost = on_con_lost
         return self
+
+    def generate_checksum(self, data):
+        checksum = zlib.crc32(data)
+        return checksum
+
+    def authenticate(self, data):
+        cobj = CMAC.new(self.key.encode(), ciphermod=AES)
+        cobj.update(data)
+        return cobj.digest()
+
+    def verify(self, data, mac):
+        cobj = CMAC.new(self.key.encode(), ciphermod=AES)
+        cobj.update(data)
+        cobj.verify(mac)
 
     def encrypt(self, data):
         aes = AES.new(

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import struct
 import sys
 import time
 from math import floor
@@ -15,24 +16,65 @@ logger = logging.getLogger(__name__)
 class ReceiveChannel(Channel):
     def datagram_received(self, data, addr):
         logger.info(f'Data received from {addr}')
-        output = data
+        udp_header = data[:16]
+        udp_header_struct = struct.unpack("!IIII", udp_header)
+        ptu_header = data[16:32]
+        ptu_header_struct = struct.unpack("!IccchxhI", ptu_header)
+        if self.auth:
+            output = data[32:-16]
+            mac = data[32 + len(output):]
+            self.verify(ptu_header + output, mac)
+        else:
+            output = data[32:]
+        checksum = self.generate_checksum(output)
+        if checksum != udp_header_struct[3]:
+            logger.warning(f'Recevied corrupted UDP data')
+        checksum = self.generate_checksum(ptu_header[:-4])
+        if checksum != ptu_header_struct[-1]:
+            logger.warning(f'Received corrupted PTU data')
         if self.direction == 'encrypt':
             output = self.decrypt(data)
         logger.info(f'Data received was "{output.decode()}"')
 
 
 class SendChannel(Channel):
+    def generate_message_data(self):
+        return f'Channel message {uuid4()} from {self.name} on {floor(time.time())}'.encode('utf-8')
+
+    def generate_udp_header(self, data):
+        udp_checksum = self.generate_checksum(data)
+        length = len(data)
+        return struct.pack("!IIII", self.port + 1, self.port, length, udp_checksum)
+
+    def generate_ptu_header(self, data):
+        ptu_header_sans_crc = struct.pack(
+            "!Iccchxh",
+            1234,
+            b'\x0f',
+            b'\x0f',
+            b'\x0f' if self.auth else b'\x00',
+            len(data),
+            1337
+        )
+        crc = self.generate_checksum(ptu_header_sans_crc)
+        return ptu_header_sans_crc + struct.pack("!I", crc)
+
     def post_at_interval(self):
         while not self.transport.is_closing():
-            data = f'Channel message {uuid4()} from {self.name} on {floor(time.time())}'.encode('utf-8')
+            data = self.generate_message_data()
             logger.info(f'Sending {data.decode()}')
             if self.direction == 'encrypt':
                 data = self.encrypt(data)
             try:
-                self.transport.sendto(data, (self.addr, self.port))
+                udp_header = self.generate_udp_header(data)
+                ptu_data = self.generate_ptu_header(data) + data
+                packet = udp_header + ptu_data
+                if self.auth:
+                    packet += self.authenticate(ptu_data)
+                self.transport.sendto(packet, (self.addr, self.port))
                 time.sleep(self.delay)
             except Exception as e:
-                logger.warning(f'Failed to send message {e}')
+                logger.warning(f'Failed to send message {e}', exc_info=e)
 
     def connection_made(self, transport):
         super().connection_made(transport)
@@ -46,6 +88,7 @@ async def run_channel(function, channel):
     kwargs = {}
     if function == 'send':
         kwargs['remote_addr'] = (channel.addr, channel.port)
+        kwargs['local_addr'] = (channel.addr, channel.port + 1)
     else:
         kwargs['local_addr'] = (channel.addr, channel.port)
 
@@ -102,6 +145,12 @@ def _create_parser():
         help="address of the channel",
         default="127.0.0.1",
     )
+    parser.add_argument(
+        "--enable-authentication",
+        help="used with decrypt to authenticate message",
+        action="store_true",
+        default=False,
+    )
     return parser
 
 
@@ -116,6 +165,7 @@ def main():
         addr=args.channel_address,
         port=args.channel_port,
         direction=args.channel_direction,
+        auth=args.enable_authentication,
     )
     channel.validate()
     channel.delay = args.channel_delay
